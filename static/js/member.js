@@ -1,9 +1,42 @@
 (function () {
   const USD_TO_TWD = 32;
+  const ADMIN_EMAIL = "admin@smartinvest.local";
   const $ = (id) => document.getElementById(id);
-  let depositPending = false;
-  let authRevision = 0;
-  let previewWallet = null;
+  const DEFAULT_MEMBERSHIP_PLANS = [
+    {
+      plan_code: "free",
+      plan_name: "免費版",
+      monthly_price_usd: 0,
+      features_json: { ai_chat_daily_limit: 5 }
+    },
+    {
+      plan_code: "pro",
+      plan_name: "進階版",
+      monthly_price_usd: 9.99,
+      features_json: { ai_chat_daily_limit: 20 }
+    },
+    {
+      plan_code: "premium",
+      plan_name: "專業版",
+      monthly_price_usd: 24.99,
+      features_json: { ai_chat_daily_limit: null }
+    }
+  ];
+  let authRefreshTimer = null;
+  let membershipRefreshInFlight = null;
+  let dataRefreshInFlight = null;
+
+  async function fetchJson(url, options = {}, timeoutMs = 2500) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
 
   function fmtTwdFromUsd(valueUsd) {
     const value = Number(valueUsd || 0) * USD_TO_TWD;
@@ -28,12 +61,63 @@
     });
   }
 
+  function fmtUsd(value) {
+    const amount = Number(value || 0);
+    if (!amount) return "免費";
+    return `US$ ${amount.toFixed(2)} / 月`;
+  }
+
+  function planDisplayName(plan) {
+    const code = String(plan?.plan_code || "").toLowerCase();
+    const defaults = {
+      free: "免費版",
+      pro: "進階版",
+      premium: "專業版"
+    };
+    return plan?.plan_name || defaults[code] || code.toUpperCase() || "未命名方案";
+  }
+
+  function planFeatureList(plan) {
+    const code = String(plan?.plan_code || "").toLowerCase();
+    const limit = plan?.features_json?.ai_chat_daily_limit;
+    const map = {
+      free: ["每日 5 次 AI 問答", "基本市場資訊", "適合初次體驗"],
+      pro: ["每日 20 次 AI 問答", "RAG 知識庫回答", "模擬交易紀錄"],
+      premium: ["不限次數 AI 問答", "AI Agent 與健康度報告", "詐騙檢測與進階紀錄"]
+    };
+    if (map[code]) return map[code];
+    return [
+      limit ? `每日 ${limit} 次 AI 問答` : "不限次數 AI 問答",
+      "會員功能權限",
+      "付款與訂閱紀錄"
+    ];
+  }
+
+  function normalizeSubscriptionPlanCode(subscription) {
+    return String(
+      subscription?.plan_code ||
+      subscription?.plan?.plan_code ||
+      subscription?.membership_plan?.plan_code ||
+      "free"
+    ).toLowerCase();
+  }
+
   function isMember() {
     return Boolean(window.authManager?.isLoggedIn?.() || window.smartInvestMembership?.isMember);
   }
 
-  function isPremiumMember() {
-    return window.authManager?.getMembershipTier?.() === "premium";
+  function isAdminMember() {
+    const email = String(window.smartInvestMembership?.email || "").trim().toLowerCase();
+    return Boolean(window.authManager?.isAdmin?.() || window.smartInvestMembership?.isAdmin || email === ADMIN_EMAIL);
+  }
+
+  function adminSubscription() {
+    return {
+      status: "active",
+      plan: { plan_code: "premium", plan_name: "專業版" },
+      source: "admin-demo",
+      role: "admin"
+    };
   }
 
   async function getAuthToken() {
@@ -79,22 +163,18 @@
       const token = await getAuthToken();
       if (token) headers.Authorization = `Bearer ${token}`;
     }
-    const res = await fetch(url, Object.assign({}, options, { headers }));
-    const data = await res.json().catch(() => ({}));
+    const { res, data } = await fetchJson(url, Object.assign({}, options, { headers }), 2800);
     if (res.status === 401) {
       throw new Error(data.error || "請先登入會員。");
     }
     if (!res.ok) {
-      const error = new Error(data.error || data.detail || "請求失敗");
-      error.code = data.code || "request_failed";
-      error.status = res.status;
-      throw error;
+      throw new Error(data.error || data.detail || "請求失敗");
     }
     return data;
   }
 
   function renderPortfolio(portfolio) {
-    renderMemberProfile();
+    if ($("memberEmail")) $("memberEmail").textContent = window.smartInvestMembership?.email || "測試會員";
     if (!portfolio) return;
     const isDemo = Boolean(window.authManager?.isDemoMember?.());
 
@@ -113,29 +193,18 @@
     const capitalList = $("capitalList");
     if (capitalList) {
       const records = capitalRecords.length ? capitalRecords.slice(0, 8) : equityCurve.slice(-8).reverse();
-      capitalList.replaceChildren();
-      if (!records.length) {
-        appendText(capitalList, "div", "尚未產生資產曲線紀錄。", "member-record-empty");
-      }
-      records.forEach((item) => {
+      capitalList.innerHTML = records.length ? records.map((item) => {
         const recordId = item.id || item.timestamp || item.ts || "";
-        const row = document.createElement("div");
-        row.className = "member-list-item";
-        const info = document.createElement("div");
-        appendText(info, "strong", fmtTwdFromUsd(item.amount_usd || item.total_value_usd));
-        appendText(info, "span", item.note || "資金紀錄");
-        row.appendChild(info);
-        const actions = document.createElement("div");
-        actions.className = "member-list-actions";
-        appendText(actions, "time", dateText(item.timestamp || item.ts));
-        if (isDemo && recordId) {
-          const button = appendText(actions, "button", "刪除", "capital-delete-btn");
-          button.type = "button";
-          button.dataset.capitalId = recordId;
-        }
-        row.appendChild(actions);
-        capitalList.appendChild(row);
-      });
+        return `
+        <div class="member-list-item">
+          <div><strong>${fmtTwdFromUsd(item.amount_usd || item.total_value_usd)}</strong><span>${item.note || "資金紀錄"}</span></div>
+          <div class="member-list-actions">
+            <time>${dateText(item.timestamp || item.ts)}</time>
+            ${isDemo && recordId ? `<button class="capital-delete-btn" type="button" data-capital-id="${recordId}">刪除</button>` : ""}
+          </div>
+        </div>
+      `;
+      }).join("") : '<div class="member-record-empty">尚未產生資產曲線紀錄。</div>';
     }
 
     const holdingTable = $("holdingTable");
@@ -151,109 +220,8 @@
             }).join("")}
           </tbody>
         </table>
-      ` : '<div class="member-record-empty">目前沒有模擬持倉。你可以在這裡建立，或前往模擬交易頁下單。</div>';
+      ` : '<div class="member-record-empty">目前沒有模擬持倉。你可以在這裡建立，或到 AI Agent 用一句話下單。</div>';
     }
-  }
-
-  function renderMemberProfile() {
-    const profile = window.authManager?.getProfile?.();
-    if ($("memberEmail")) $("memberEmail").textContent = profile?.email || "尚未登入";
-    if ($("memberName")) $("memberName").textContent = profile?.displayName || "會員";
-    if ($("memberAvatar")) {
-      $("memberAvatar").src = `/static/images/agent-cat-${profile?.avatarKey || "happy"}.png`;
-    }
-    const isTestPremium = Boolean(window.authManager?.isDemoMember?.());
-    const premium = isPremiumMember();
-    const tier = !isMember() ? "訪客" : isTestPremium ? "進階會員（TEST）" : premium ? "進階會員" : "免費會員";
-    if ($("memberCurrentTier")) $("memberCurrentTier").textContent = `目前方案：${tier}`;
-    if ($("memberFreeTag")) $("memberFreeTag").hidden = !isMember() || premium;
-    if ($("memberPremiumTag")) $("memberPremiumTag").textContent = premium ? "目前方案" : "規劃中";
-    $("memberFreePlan")?.classList.toggle("is-current", isMember() && !premium);
-    $("memberPremiumPlan")?.classList.toggle("is-current", premium);
-    if ($("memberPremiumAction")) {
-      $("memberPremiumAction").innerHTML = premium
-        ? '查看會員狀態 <i class="fas fa-arrow-right"></i>'
-        : '了解訂閱進度 <i class="fas fa-arrow-right"></i>';
-    }
-    if ($("memberSubscribeLabel")) {
-      $("memberSubscribeLabel").textContent = premium ? "查看進階會員權益" : "訂閱進階會員";
-    }
-    if ($("memberSubscribeHint")) {
-      $("memberSubscribeHint").textContent = premium
-        ? `${isTestPremium ? "TEST 帳號" : "原有會員"} · 目前方案`
-        : "NT$399／月 · 規劃中";
-    }
-  }
-
-  function openProfileEditor() {
-    if (!requireMember()) return;
-    const editor = $("profileEditor");
-    const profile = window.authManager?.getProfile?.();
-    if (!editor || !profile) return;
-    if ($("profileDisplayName")) $("profileDisplayName").value = profile.displayName;
-    const choice = editor.querySelector(`input[name="avatarKey"][value="${profile.avatarKey}"]`);
-    if (choice) choice.checked = true;
-    if ($("profileStatus")) $("profileStatus").textContent = "";
-    editor.hidden = false;
-    $("profileDisplayName")?.focus();
-  }
-
-  function closeProfileEditor() {
-    if ($("profileEditor")) $("profileEditor").hidden = true;
-  }
-
-  function setProfileStatus(message, isError = false) {
-    const status = $("profileStatus");
-    if (!status) return;
-    status.textContent = message;
-    status.classList.toggle("is-error", isError);
-  }
-
-  async function saveProfile(event) {
-    event.preventDefault();
-    if (!requireMember()) return;
-    const form = $("profileForm");
-    const button = $("saveProfileBtn");
-    if (!form || button?.disabled) return;
-    const avatarKey = form.querySelector('input[name="avatarKey"]:checked')?.value || "happy";
-    if (button) button.disabled = true;
-    setProfileStatus("儲存中...");
-    try {
-      await window.authManager.updateProfile({
-        displayName: $("profileDisplayName")?.value || "",
-        avatarKey,
-      });
-      renderMemberProfile();
-      closeProfileEditor();
-      window.toast?.("個人資料", "名稱與頭貼已更新。");
-    } catch (error) {
-      setProfileStatus(error.message || "儲存失敗，請稍後重試。", true);
-    } finally {
-      if (button) button.disabled = false;
-    }
-  }
-
-  function openSubscriptionDialog() {
-    const dialog = $("subscriptionDialog");
-    if (!dialog) return;
-    const tier = !isMember() ? "尚未登入" : window.authManager?.isDemoMember?.() ? "進階會員（TEST，無扣款）" : isPremiumMember() ? "進階會員（原有會員）" : "免費會員（尚無付費訂閱）";
-    if ($("subscriptionAccountStatus")) $("subscriptionAccountStatus").textContent = `目前狀態：${tier}`;
-    if (typeof dialog.showModal === "function") dialog.showModal();
-    else dialog.setAttribute("open", "");
-  }
-
-  function closeSubscriptionDialog() {
-    const dialog = $("subscriptionDialog");
-    if (!dialog) return;
-    if (typeof dialog.close === "function") dialog.close();
-    else dialog.removeAttribute("open");
-  }
-
-  function setRealAssetAccess(allowed, title, description) {
-    if ($("realAssetForm")) $("realAssetForm").hidden = !allowed;
-    if ($("realAssetAccess")) $("realAssetAccess").hidden = allowed;
-    if ($("realAssetAccessTitle")) $("realAssetAccessTitle").textContent = title;
-    if ($("realAssetAccessText")) $("realAssetAccessText").textContent = description;
   }
 
   function renderTrades(trades) {
@@ -274,158 +242,148 @@
     `).join("");
   }
 
-  function appendText(parent, tag, text, className) {
-    const node = document.createElement(tag);
-    if (className) node.className = className;
-    node.textContent = text;
-    parent.appendChild(node);
-    return node;
-  }
-
-  function fmtUsd(value) {
-    if (value === null || value === undefined || value === "") return "價格未取得";
-    const number = Number(value);
-    if (!Number.isFinite(number)) return "價格未取得";
-    return "USD " + number.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  }
-
-  function renderRealAssetMessage(message, kind) {
-    const status = $("realAssetStatus");
-    if (!status) return;
-    status.textContent = message;
-    status.dataset.kind = kind || "info";
-  }
-
-  function renderRealAssets(portfolio) {
-    const root = $("realAssetAccounts");
-    if (!root) return;
-    root.replaceChildren();
-    const accounts = Array.isArray(portfolio?.accounts) ? portfolio.accounts : [];
-    if (!accounts.length) {
-      renderRealAssetMessage("可輸入 Ethereum 公開地址體驗連結流程；目前不讀取真實資產。", "info");
-      return;
+  function renderSubscription(subscription) {
+    const status = String(subscription?.status || "free").toLowerCase();
+    const planName = (
+      subscription?.plan?.plan_name ||
+      subscription?.membership_plan?.plan_name ||
+      planDisplayName({ plan_code: normalizeSubscriptionPlanCode(subscription) })
+    );
+    const badge = $("subscriptionStatusBadge");
+    if (badge) {
+      badge.textContent = status === "active" ? "已啟用" : status === "free" ? "免費方案" : status;
+      badge.classList.toggle("is-active", status === "active");
     }
-    renderRealAssetMessage(accounts[0]?.account?.preview ? "已建立錢包連結畫面示範；尚未連接真實服務。" : `已連結 ${accounts.length} 個唯讀錢包。`, "success");
-    accounts.forEach((group) => {
-      const account = group?.account || {};
-      const snapshot = group?.snapshot || null;
-      const balances = Array.isArray(group?.balances) ? group.balances : [];
-      const card = document.createElement("article");
-      card.className = "real-account";
-      const head = document.createElement("div");
-      head.className = "real-account-head";
-      const identity = document.createElement("div");
-      appendText(identity, "strong", account.address_masked || "Ethereum 錢包");
-      appendText(identity, "span", account.preview ? "連結畫面示範 · 未讀取資產" : "Ethereum Mainnet · Alchemy 唯讀", "real-account-meta");
-      head.appendChild(identity);
-      const actions = document.createElement("div");
-      actions.className = "real-account-actions";
-      if (account.status === "active") {
-        const sync = appendText(actions, "button", account.preview ? "示範同步" : "立即同步");
-        sync.type = "button";
-        sync.dataset.assetAction = "sync";
-        sync.dataset.accountId = account.id || "";
-        const disconnect = appendText(actions, "button", account.preview ? "解除示範連結" : "停止連結", "secondary");
-        disconnect.type = "button";
-        disconnect.dataset.assetAction = "disconnect";
-        disconnect.dataset.accountId = account.id || "";
-      } else {
-        appendText(actions, "span", "已停止", "real-disconnected");
-      }
-      head.appendChild(actions);
-      card.appendChild(head);
+    if ($("subscriptionPlanName")) $("subscriptionPlanName").textContent = planName;
+    if ($("subscriptionSource")) $("subscriptionSource").textContent = subscription?.source || "local";
+    if ($("subscriptionMode")) $("subscriptionMode").textContent = subscription?.source === "demo" ? "Demo / Mock checkout" : "Mock checkout";
+    if ($("subscriptionNote")) {
+      $("subscriptionNote").textContent = status === "active"
+        ? "目前已可展示訂閱狀態。正式第三方金流仍列 Phase 2，MVP 先保留付款紀錄與訂閱資料流程。"
+        : "目前使用免費方案。可按下方方案按鈕模擬升級，系統會建立 mock checkout 結果。";
+    }
+  }
 
-      const summary = document.createElement("div");
-      summary.className = "real-account-summary";
-      appendText(summary, "span", account.preview ? "展示模式" : snapshot ? `狀態：${snapshot.status}` : "尚無快照");
-      appendText(summary, "strong", account.preview ? "未讀取真實資產" : snapshot ? fmtUsd(snapshot.total_value_usd) : "尚未同步");
-      appendText(summary, "small", account.preview ? "正式串接前不顯示餘額" : snapshot?.captured_at ? `資料時間：${dateText(snapshot.captured_at)}` : "同步後會顯示 as-of 時間");
-      card.appendChild(summary);
+  function renderMembershipPlans(plans, subscription) {
+    const wrap = $("membershipPlans");
+    if (!wrap) return;
+    const activeCode = normalizeSubscriptionPlanCode(subscription);
+    const list = Array.isArray(plans) && plans.length ? plans : DEFAULT_MEMBERSHIP_PLANS;
+    wrap.innerHTML = list.map((plan) => {
+      const code = String(plan.plan_code || "").toLowerCase();
+      const active = code === activeCode || (activeCode === "premium" && code === "premium");
+      const features = planFeatureList(plan).map((item) => `<li><i class="fas fa-check"></i><span>${item}</span></li>`).join("");
+      return `
+        <article class="membership-plan ${active ? "is-current" : ""}">
+          <div class="membership-plan-head">
+            <span>${code || "plan"}</span>
+            ${active ? "<em>目前方案</em>" : ""}
+          </div>
+          <strong>${planDisplayName(plan)}</strong>
+          <div class="membership-price">${fmtUsd(plan.monthly_price_usd)}</div>
+          <ul>${features}</ul>
+          <button type="button" data-plan-code="${code}" ${active ? "disabled" : ""}>
+            ${active ? "目前使用中" : "模擬升級"}
+          </button>
+        </article>
+      `;
+    }).join("") || '<div class="member-record-empty">目前沒有可顯示的會員方案。</div>';
+  }
 
-      const list = document.createElement("div");
-      list.className = "real-balance-list";
-      if (!balances.length) {
-        appendText(list, "p", account.preview ? "這裡會顯示同步後的資產明細。" : "沒有可顯示的錢包餘額。");
-      } else {
-        balances.forEach((item) => {
-          const row = document.createElement("div");
-          appendText(row, "strong", item.symbol || "Unknown");
-          appendText(row, "span", `${fmtQty(item.quantity)} · ${fmtUsd(item.value_usd)}`);
-          const price = item.price_usd === null || item.price_usd === undefined
-            ? "無 USD 價格，僅顯示數量"
-            : `單價 ${fmtUsd(item.price_usd)} · ${item.price_source || "來源未知"} · ${item.price_as_of ? dateText(item.price_as_of) : "時間未知"}`;
-          appendText(row, "small", price);
-          list.appendChild(row);
-        });
-      }
-      card.appendChild(list);
-      root.appendChild(card);
+  async function refreshMembershipBilling() {
+    if (membershipRefreshInFlight) return membershipRefreshInFlight;
+    membershipRefreshInFlight = (async () => {
+    const plansData = await fetchJson("/api/membership/plans", {}, 1800)
+      .then(({ res, data }) => res.ok ? data : { plans: DEFAULT_MEMBERSHIP_PLANS })
+      .catch(() => ({ plans: DEFAULT_MEMBERSHIP_PLANS }));
+    const plans = Array.isArray(plansData.plans) && plansData.plans.length
+      ? plansData.plans
+      : DEFAULT_MEMBERSHIP_PLANS;
+    let subscription = isAdminMember() ? adminSubscription() : { status: "free", source: "guest" };
+    if (isAdminMember()) {
+      renderSubscription(subscription);
+      renderMembershipPlans(plans, subscription);
+    }
+    const token = await waitForAuthToken(1200);
+    if (!token && isAdminMember()) return;
+    if (token) {
+      const subData = await request("/api/membership/subscription", {
+        headers: { Authorization: `Bearer ${token}` }
+      }).catch(() => ({ subscription }));
+      subscription = subData.subscription || subscription;
+    }
+    renderSubscription(subscription);
+    renderMembershipPlans(plans, subscription);
+    })().finally(() => {
+      membershipRefreshInFlight = null;
     });
-  }
-
-  async function refreshRealAssets(headers, revision = authRevision) {
-    if (revision !== authRevision) return;
-    if (isPremiumMember()) {
-      setRealAssetAccess(true, "", "");
-      renderRealAssets({ accounts: previewWallet ? [{
-        account: { id: "preview", status: "active", preview: true, address_masked: `${previewWallet.slice(0, 6)}…${previewWallet.slice(-4)}` },
-        snapshot: null,
-        balances: []
-      }] : [] });
-      return;
-    }
-    $("realAssetAccounts")?.replaceChildren();
-    setRealAssetAccess(false, isMember() ? "目前為免費會員" : "登入後查看使用資格",
-      isMember() ? "錢包連結流程示範屬進階會員；你仍可使用模擬交易與基礎 AI 教練。" : "錢包連結流程示範開放給進階會員。");
-    renderRealAssetMessage(isMember() ? "免費會員目前沒有錢包連結權限。" : "登入後可查看連結流程示範。", "info");
+    return membershipRefreshInFlight;
   }
 
   async function refreshData() {
-    const revision = authRevision;
+    if (dataRefreshInFlight) return dataRefreshInFlight;
+    dataRefreshInFlight = (async () => {
     const token = await waitForAuthToken();
-    if (!token || revision !== authRevision) return;
+    if (!token) return;
     const headers = { Authorization: `Bearer ${token}` };
-    const [portfolioData, tradeData] = await Promise.all([
+    const [portfolioData, tradeData] = await Promise.allSettled([
       request("/api/sim-trade/portfolio", { headers }),
       request("/api/sim-trade/history?limit=50", { headers })
     ]);
-    if (revision !== authRevision) return;
-    renderPortfolio(portfolioData.portfolio);
-    renderTrades(tradeData.trades || []);
-    await refreshRealAssets(headers, revision);
+    if (portfolioData.status === "fulfilled") renderPortfolio(portfolioData.value.portfolio);
+    if (tradeData.status === "fulfilled") renderTrades(tradeData.value.trades || []);
+    })().finally(() => {
+      dataRefreshInFlight = null;
+    });
+    return dataRefreshInFlight;
+  }
+
+  function scheduleAuthRefresh() {
+    window.clearTimeout(authRefreshTimer);
+    authRefreshTimer = window.setTimeout(() => {
+      refreshMembershipBilling().catch(() => {});
+      refreshData().catch(() => {});
+    }, 180);
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    renderMemberProfile();
-    $("editProfileBtn")?.addEventListener("click", openProfileEditor);
-    document.querySelector(".user-menu-profile-link")?.addEventListener("click", openProfileEditor);
-    $("cancelProfileEdit")?.addEventListener("click", closeProfileEditor);
-    document.querySelectorAll("[data-profile-cancel]").forEach((button) => {
-      button.addEventListener("click", closeProfileEditor);
-    });
-    $("profileForm")?.addEventListener("submit", saveProfile);
-    document.querySelectorAll("[data-subscribe-open]").forEach((button) => {
-      button.addEventListener("click", openSubscriptionDialog);
-    });
-    $("subscriptionClose")?.addEventListener("click", closeSubscriptionDialog);
-    $("subscriptionContinueFree")?.addEventListener("click", closeSubscriptionDialog);
-    $("subscriptionViewPlan")?.addEventListener("click", closeSubscriptionDialog);
-    window.authManager?.whenReady?.().then(() => {
-      renderMemberProfile();
-      refreshRealAssets();
-      if (window.location.hash === "#profileEditor") openProfileEditor();
+    renderSubscription({ status: "free", source: "loading" });
+    renderMembershipPlans(DEFAULT_MEMBERSHIP_PLANS, { status: "free" });
+    renderPortfolio({ cash: 100000, total_value_usd: 100000, positions: [], equity_curve: [], capital_records: [] });
+    renderTrades([]);
+
+    refreshMembershipBilling().catch(() => {
+      renderSubscription({ status: "free", source: "fallback" });
     });
     refreshData().catch(() => {});
 
+    $("membershipPlans")?.addEventListener("click", async (event) => {
+      const btn = event.target.closest("button[data-plan-code]");
+      if (!btn) return;
+      if (!requireMember()) return;
+      const planCode = btn.dataset.planCode || "pro";
+      btn.disabled = true;
+      btn.textContent = "處理中...";
+      try {
+        const data = await request("/api/membership/mock-checkout", {
+          method: "POST",
+          body: JSON.stringify({ plan_code: planCode })
+        });
+        renderSubscription(data.subscription || { status: "active", plan_code: planCode, source: data.mode || "mock" });
+        await refreshMembershipBilling();
+        alert("已完成 mock checkout，訂閱狀態已更新。");
+      } catch (error) {
+        alert(error.message || "會員方案更新失敗。");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     $("capitalForm")?.addEventListener("submit", (event) => {
       event.preventDefault();
-      if (depositPending) return;
       if (!requireMember()) return;
       const amountTwd = Number($("capitalAmount")?.value || 0);
-      if (!Number.isFinite(amountTwd) || amountTwd <= 0) return alert("請輸入大於 0 的新增資金。");
-      depositPending = true;
-      const submitButton = $("capitalForm")?.querySelector('[type="submit"]');
-      if (submitButton) submitButton.disabled = true;
+      if (amountTwd <= 0) return alert("請輸入大於 0 的新增資金。");
       request("/api/sim-trade/deposit", {
         method: "POST",
         body: JSON.stringify({
@@ -438,9 +396,6 @@
         return refreshData();
       }).catch((error) => {
         alert(error.message || "新增資金失敗");
-      }).finally(() => {
-        depositPending = false;
-        if (submitButton) submitButton.disabled = false;
       });
     });
 
@@ -496,34 +451,6 @@
         alert(error.message || "重置失敗");
       }
     });
-
-    $("realAssetForm")?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      if (!requireMember()) return;
-      if (!isPremiumMember()) return;
-      const input = $("realAssetAddress");
-      const address = input?.value?.trim() || "";
-      if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
-        renderRealAssetMessage("請輸入 0x 開頭、共 42 字元的 Ethereum 公開地址。", "warning");
-        return;
-      }
-      previewWallet = address;
-      if (input) input.value = "";
-      refreshRealAssets();
-    });
-
-    $("realAssetAccounts")?.addEventListener("click", (event) => {
-      const button = event.target.closest("button[data-asset-action]");
-      if (!button || button.disabled) return;
-      if (!isPremiumMember() || !previewWallet) return;
-      const action = button.dataset.assetAction;
-      if (action === "sync") {
-        renderRealAssetMessage("已點擊示範同步；目前不會讀取或顯示真實資產。", "info");
-      } else if (action === "disconnect") {
-        previewWallet = null;
-        refreshRealAssets();
-      }
-    });
   });
 
   window.addEventListener("smartinvest:sim-trade-updated", () => {
@@ -531,17 +458,6 @@
   });
 
   window.addEventListener("smartinvest:auth-state", () => {
-    authRevision += 1;
-    previewWallet = null;
-    renderMemberProfile();
-    refreshRealAssets();
-    if (!isMember()) {
-      return;
-    }
-    refreshData().catch(() => {});
-  });
-  window.addEventListener("smartinvest:profile-updated", renderMemberProfile);
-  window.addEventListener("hashchange", () => {
-    if (window.location.hash === "#profileEditor") openProfileEditor();
+    scheduleAuthRefresh();
   });
 })();

@@ -581,6 +581,12 @@
   box-shadow:0 14px 30px rgba(249,115,22,.18);
 }
 
+.tool-directory-item .text-icon{
+  font-size:28px;
+  font-weight:950;
+  line-height:1;
+}
+
 .tool-directory-item strong{
   display:block;
   color:var(--dark);

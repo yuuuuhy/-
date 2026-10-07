@@ -3,14 +3,15 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 const supabaseConfig = window.__SUPABASE_CONFIG__ || {};
 const supabaseUrl = supabaseConfig.url || "";
 const supabaseAnonKey = supabaseConfig.anonKey || "";
-localStorage.removeItem("si_guest_mode");
+const GUEST_MODE_KEY = "si_guest_mode";
 const DEMO_MEMBER_KEY = "si_demo_member";
+const ADMIN_DEMO_KEY = "si_demo_admin";
 const DEMO_MEMBER_TOKEN = "smartinvest-demo-member-token";
+const ADMIN_DEMO_TOKEN = "smartinvest-demo-admin-token";
 const DEMO_MEMBER_EMAIL = "test@smartinvest.local";
 const DEMO_MEMBER_PASSWORD = "Test123456";
-const DEMO_PROFILE_KEY = "si_demo_profile";
-const PROFILE_AVATARS = new Set(["happy", "calm", "focus", "neutral"]);
-const LEGACY_PREMIUM_CUTOFF = Date.parse("2026-09-29T11:39:15Z");
+const ADMIN_DEMO_EMAIL = "admin@smartinvest.local";
+const ADMIN_DEMO_PASSWORD = "Admin123456";
 const AI_COACH_CONVERSATION_KEY = "smartinvest_ai_coach_conversation_id";
 const SUPABASE_STORAGE_KEY = "smartinvest_supabase_auth";
 
@@ -40,6 +41,7 @@ const AUTH_HASH_KEYS = new Set([
 let currentSession = null;
 let authReady = false;
 let resolveAuthReady;
+let lastAuthStateSignature = "";
 const authReadyPromise = new Promise((resolve) => {
     resolveAuthReady = resolve;
 });
@@ -59,22 +61,25 @@ function markAuthReady() {
 }
 
 function buildDemoSession() {
-    let savedProfile = {};
-    try {
-        savedProfile = JSON.parse(localStorage.getItem(DEMO_PROFILE_KEY) || "{}") || {};
-    } catch {
-        savedProfile = {};
-    }
     return {
         access_token: DEMO_MEMBER_TOKEN,
         user: {
             id: "demo-member",
             email: DEMO_MEMBER_EMAIL,
+            is_demo: true
+        }
+    };
+}
+
+function buildAdminDemoSession() {
+    return {
+        access_token: ADMIN_DEMO_TOKEN,
+        user: {
+            id: "demo-admin",
+            email: ADMIN_DEMO_EMAIL,
             is_demo: true,
-            user_metadata: {
-                display_name: typeof savedProfile.display_name === "string" ? savedProfile.display_name : "",
-                avatar_key: PROFILE_AVATARS.has(savedProfile.avatar_key) ? savedProfile.avatar_key : "happy"
-            }
+            is_admin: true,
+            app_metadata: { role: "admin" }
         }
     };
 }
@@ -83,29 +88,32 @@ function isDemoMemberActive() {
     return localStorage.getItem(DEMO_MEMBER_KEY) === "1" || sessionStorage.getItem(DEMO_MEMBER_KEY) === "1";
 }
 
+function isAdminDemoActive() {
+    return localStorage.getItem(ADMIN_DEMO_KEY) === "1" || sessionStorage.getItem(ADMIN_DEMO_KEY) === "1";
+}
+
 function activateDemoMember() {
     localStorage.setItem(DEMO_MEMBER_KEY, "1");
+    localStorage.removeItem(ADMIN_DEMO_KEY);
+    sessionStorage.removeItem(ADMIN_DEMO_KEY);
     sessionStorage.removeItem(DEMO_MEMBER_KEY);
+    localStorage.removeItem(GUEST_MODE_KEY);
     currentSession = buildDemoSession();
     updateMembership(currentSession);
     setAuthUiBySession(currentSession);
     markAuthReady();
 }
 
-function applyAuthState(session) {
-    // Supabase 會在初始化時送出 INITIAL_SESSION(null)。Demo 會員是本機
-    // session，不能被這個空事件覆寫，否則切頁時 UI 會看起來像自動登出。
-    if (session && !session.user?.is_demo) {
-        localStorage.removeItem(DEMO_MEMBER_KEY);
-        sessionStorage.removeItem(DEMO_MEMBER_KEY);
-    }
-    const effectiveSession = (!session && isDemoMemberActive())
-        ? buildDemoSession()
-        : (session || null);
-    currentSession = effectiveSession;
-    updateMembership(effectiveSession);
-    setAuthUiBySession(effectiveSession);
-    return effectiveSession;
+function activateAdminDemo() {
+    localStorage.setItem(ADMIN_DEMO_KEY, "1");
+    localStorage.removeItem(DEMO_MEMBER_KEY);
+    sessionStorage.removeItem(DEMO_MEMBER_KEY);
+    sessionStorage.removeItem(ADMIN_DEMO_KEY);
+    localStorage.removeItem(GUEST_MODE_KEY);
+    currentSession = buildAdminDemoSession();
+    updateMembership(currentSession);
+    setAuthUiBySession(currentSession);
+    markAuthReady();
 }
 
 function requireSupabase() {
@@ -126,33 +134,10 @@ function getUserLabel(user) {
     return metadata.display_name || metadata.full_name || metadata.name || email.split("@")[0] || "Smart Invest 會員";
 }
 
-function getProfile() {
-    const user = currentSession?.user;
-    if (!user) return null;
-    const avatarKey = user.user_metadata?.avatar_key;
-    return {
-        displayName: getUserLabel(user),
-        avatarKey: PROFILE_AVATARS.has(avatarKey) ? avatarKey : "happy",
-        email: user.email || ""
-    };
-}
-
-function getMembershipTier() {
-    if (!isLoggedIn()) return "guest";
-    if (currentSession.user?.is_demo) return "premium";
-    const createdAt = Date.parse(currentSession.user?.created_at || "");
-    return Number.isFinite(createdAt) && createdAt <= LEGACY_PREMIUM_CUTOFF ? "premium" : "free";
-}
-
-function renderUserAvatars(profile) {
-    const imageUrl = profile ? `/static/images/agent-cat-${profile.avatarKey}.png` : "";
-    document.querySelectorAll("[data-user-avatar]").forEach((image) => {
-        image.hidden = !profile;
-        if (profile) image.src = imageUrl;
-    });
-    document.querySelectorAll("[data-user-avatar-icon]").forEach((icon) => {
-        icon.hidden = Boolean(profile);
-    });
+function getUserInitial(user) {
+    const label = getUserLabel(user);
+    const email = String(user?.email || "").trim();
+    return String(label || email || "U").trim().slice(0, 1).toUpperCase();
 }
 
 function getCleanRedirectUrl() {
@@ -244,60 +229,96 @@ async function applyAuthFromUrl() {
         currentSession = session;
         updateMembership(session);
         setAuthUiBySession(session);
-        console.log("[auth] redirect session restored", Boolean(session));
+        console.log("[auth] redirect session", session);
         clearUrlHashAfterLogin();
     }
 
     return { handled, session };
 }
 
-function updateMembership(session) {
+function buildAuthState(session) {
     const user = session?.user || null;
+    const isAdmin = Boolean(user?.is_admin || user?.app_metadata?.role === "admin" || String(user?.email || "").toLowerCase() === ADMIN_DEMO_EMAIL);
+    const isGuest = localStorage.getItem(GUEST_MODE_KEY) === "1";
+    return {
+        isMember: Boolean(user),
+        isAdmin,
+        isGuest,
+        email: user?.email || "",
+        userId: user?.id || ""
+    };
+}
+
+function updateMembership(session, options = {}) {
+    const user = session?.user || null;
+    const state = buildAuthState(session);
     if (user) {
         window.smartInvestMembership = {
             isMember: true,
+            isAdmin: state.isAdmin,
+            planCode: state.isAdmin ? "premium" : "member",
             email: user.email || "已登入"
         };
     } else {
         window.smartInvestMembership = {
             isMember: false,
+            isAdmin: false,
+            planCode: "free",
             email: ""
         };
     }
 
     document.body?.classList.toggle("is-logged-in", Boolean(user));
     document.body?.classList.toggle("is-guest", !user);
+    document.body?.classList.toggle("is-guest-mode", !user && state.isGuest);
     document.body?.classList.toggle("is-member-locked", !Boolean(user));
     document.querySelectorAll(".member-nav i").forEach((icon) => {
         icon.classList.toggle("fa-lock", !user);
         icon.classList.toggle("fa-unlock", Boolean(user));
     });
-    window.dispatchEvent(new CustomEvent("smartinvest:auth-state", {
-        detail: {
-            isMember: Boolean(user),
-            isGuest: !user,
-            email: user?.email || "",
-            userId: user?.id || ""
-        }
-    }));
+    const signature = JSON.stringify(state);
+    if (options.force || signature !== lastAuthStateSignature) {
+        lastAuthStateSignature = signature;
+        window.dispatchEvent(new CustomEvent("smartinvest:auth-state", { detail: state }));
+    }
 }
 
 function setAuthUiBySession(session) {
     const loginToggle = document.getElementById("loginToggle");
+    const guestButton = document.querySelector(".auth-area > .guest-btn");
     const accountPopup = document.getElementById("accountPopup");
     const userSection = document.getElementById("user-section");
     const userEmail = document.getElementById("user-email");
     const userName = document.getElementById("user-name");
-    renderUserAvatars(session?.user ? getProfile() : null);
+    const isGuest = localStorage.getItem(GUEST_MODE_KEY) === "1";
+    const avatarEls = document.querySelectorAll(".user-avatar[data-user-initial]");
 
     if (session && session.user) {
+        const initial = getUserInitial(session.user);
+        localStorage.removeItem(GUEST_MODE_KEY);
         if (loginToggle) loginToggle.style.display = "none";
+        if (guestButton) guestButton.style.display = "none";
         if (accountPopup) accountPopup.classList.remove("show");
         if (userSection) userSection.style.display = "block";
         if (userName) userName.innerText = getUserLabel(session.user);
         if (userEmail) userEmail.innerText = session.user.email || "已登入";
+        avatarEls.forEach((el) => {
+            el.textContent = "";
+            el.dataset.userInitial = initial;
+        });
+    } else if (isGuest) {
+        if (loginToggle) loginToggle.style.display = "inline-flex";
+        if (guestButton) guestButton.style.display = "none";
+        if (userSection) userSection.style.display = "block";
+        if (userName) userName.innerText = "訪客模式";
+        if (userEmail) userEmail.innerText = "訪客模式";
+        avatarEls.forEach((el) => {
+            el.textContent = "";
+            el.dataset.userInitial = "G";
+        });
     } else {
         if (loginToggle) loginToggle.style.display = "inline-flex";
+        if (guestButton) guestButton.style.display = "inline-flex";
         if (userSection) userSection.style.display = "none";
     }
 }
@@ -320,18 +341,19 @@ function notifyRequireLogin(featureName) {
 }
 
 async function refreshSession() {
+    if (isAdminDemoActive()) {
+        currentSession = buildAdminDemoSession();
+        updateMembership(currentSession);
+        setAuthUiBySession(currentSession);
+        return currentSession;
+    }
     if (isDemoMemberActive()) {
         currentSession = buildDemoSession();
         updateMembership(currentSession);
         setAuthUiBySession(currentSession);
         return currentSession;
     }
-    if (!supabase) {
-        currentSession = null;
-        updateMembership(null);
-        setAuthUiBySession(null);
-        return null;
-    }
+    if (!supabase) return null;
     try {
         const { data, error } = await supabase.auth.getSession();
         if (error) throw error;
@@ -342,7 +364,7 @@ async function refreshSession() {
     }
     updateMembership(currentSession);
     setAuthUiBySession(currentSession);
-    console.log("[auth] refresh session restored", Boolean(currentSession));
+    console.log("[auth] refresh session", currentSession);
     return currentSession;
 }
 
@@ -350,6 +372,7 @@ window.authManager = {
     loginWithGoogle: async () => {
         if (!requireSupabase()) return;
         try {
+            localStorage.removeItem(GUEST_MODE_KEY);
             const { error } = await supabase.auth.signInWithOAuth({
                 provider: "google",
                 options: {
@@ -361,63 +384,79 @@ window.authManager = {
             alert(`Google 登入失敗: ${error.message}`);
         }
     },
-    loginWithEmail: async (email, password) => {
-        if (!email || !password) return alert("請輸入信箱與密碼");
+    loginWithEmail: async (email, password, options = {}) => {
+        const silent = Boolean(options?.silent);
+        const normalizedEmail = String(email || "").trim().toLowerCase();
+        if (normalizedEmail === ADMIN_DEMO_EMAIL && password === ADMIN_DEMO_PASSWORD) {
+            activateAdminDemo();
+            if (!silent) alert("已使用管理員 Demo 帳號登入");
+            return;
+        }
+        if (!email || !password) {
+            if (!silent) alert("請輸入信箱與密碼");
+            return;
+        }
         if (email.trim().toLowerCase() === DEMO_MEMBER_EMAIL && password === DEMO_MEMBER_PASSWORD) {
             activateDemoMember();
-            alert("已使用 Demo 會員登入");
+            if (!silent) alert("已使用 Demo 會員登入");
             return;
         }
         if (!requireSupabase()) return;
         try {
-            const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+            localStorage.removeItem(DEMO_MEMBER_KEY);
+            sessionStorage.removeItem(DEMO_MEMBER_KEY);
+            localStorage.removeItem(ADMIN_DEMO_KEY);
+            sessionStorage.removeItem(ADMIN_DEMO_KEY);
+            localStorage.removeItem(GUEST_MODE_KEY);
+            const { data, error } = await supabase.auth.signInWithPassword({ email, password });
             if (error) throw error;
-            if (data?.session) applyAuthState(data.session);
-            alert("登入成功！");
-            window.location.reload();
+            currentSession = data?.session || currentSession;
+            updateMembership(currentSession, { force: true });
+            setAuthUiBySession(currentSession);
+            if (!silent) alert("登入成功！");
         } catch (error) {
             alert(`登入失敗: ${error.message}`);
         }
     },
     signUpWithEmail: async (email, password, metadata = {}) => {
-        if (!requireSupabase()) return false;
-        if (!email || !password) {
-            alert("請輸入信箱與密碼");
-            return false;
-        }
+        if (!requireSupabase()) return;
+        if (!email || !password) return alert("請輸入信箱與密碼");
         try {
+            localStorage.removeItem(DEMO_MEMBER_KEY);
+            sessionStorage.removeItem(DEMO_MEMBER_KEY);
+            localStorage.removeItem(ADMIN_DEMO_KEY);
+            sessionStorage.removeItem(ADMIN_DEMO_KEY);
+            localStorage.removeItem(GUEST_MODE_KEY);
             const safeMeta = metadata && typeof metadata === "object" ? metadata : {};
             const payload = { email, password };
             if (Object.keys(safeMeta).length) {
                 payload.options = { data: safeMeta };
             }
-            const { data, error } = await supabase.auth.signUp(payload);
+            const { error } = await supabase.auth.signUp(payload);
             if (error) throw error;
-            if (data?.session) applyAuthState(data.session);
             alert("註冊成功，請檢查信箱完成驗證（若已關閉驗證則會直接登入）");
             window.location.reload();
-            return true;
         } catch (error) {
             alert(`註冊失敗: ${error.message}`);
-            return false;
         }
     },
     logoutUser: async () => {
         try {
+            localStorage.removeItem(DEMO_MEMBER_KEY);
+            sessionStorage.removeItem(DEMO_MEMBER_KEY);
+            localStorage.removeItem(ADMIN_DEMO_KEY);
+            sessionStorage.removeItem(ADMIN_DEMO_KEY);
+            localStorage.removeItem(GUEST_MODE_KEY);
+            localStorage.removeItem(AI_COACH_CONVERSATION_KEY);
+            localStorage.removeItem("conversation_id");
             if (supabase) {
                 const { error } = await supabase.auth.signOut();
                 if (error) throw error;
             }
-            localStorage.removeItem(DEMO_MEMBER_KEY);
-            sessionStorage.removeItem(DEMO_MEMBER_KEY);
-            localStorage.removeItem(AI_COACH_CONVERSATION_KEY);
-            localStorage.removeItem("conversation_id");
-            applyAuthState(null);
             alert("已登出");
             window.location.reload();
         } catch (error) {
             console.error("登出失敗", error);
-            alert(`登出失敗，請重試：${error.message}`);
         }
     },
     resetPassword: async (email) => {
@@ -433,7 +472,22 @@ window.authManager = {
             alert(`重設密碼失敗: ${error.message}`);
         }
     },
+    continueAsGuest: () => {
+            localStorage.removeItem(DEMO_MEMBER_KEY);
+            sessionStorage.removeItem(DEMO_MEMBER_KEY);
+            localStorage.removeItem(ADMIN_DEMO_KEY);
+            sessionStorage.removeItem(ADMIN_DEMO_KEY);
+        localStorage.removeItem(AI_COACH_CONVERSATION_KEY);
+        localStorage.removeItem("conversation_id");
+        localStorage.setItem(GUEST_MODE_KEY, "1");
+        currentSession = null;
+        updateMembership(null);
+        setAuthUiBySession(null);
+        alert("已切換為訪客模式");
+    },
+    isGuestMode: () => localStorage.getItem(GUEST_MODE_KEY) === "1",
     isDemoMember: () => isDemoMemberActive(),
+    isAdmin: () => isAdminDemoActive() || Boolean(currentSession?.user?.is_admin || currentSession?.user?.app_metadata?.role === "admin"),
     isLoggedIn: () => isLoggedIn(),
     isReady: () => authReady,
     whenReady: () => authReadyPromise,
@@ -446,46 +500,21 @@ window.authManager = {
         return notifyRequireLogin(featureName);
     },
     openLogin: () => openLoginPopup(),
-    getProfile: () => getProfile(),
-    getMembershipTier: () => getMembershipTier(),
-    updateProfile: async ({ displayName, avatarKey }) => {
-        if (!isLoggedIn()) throw new Error("請先登入會員。");
-        const name = String(displayName || "").trim();
-        if (!name || name.length > 40 || /[\r\n\x00-\x1f]/.test(name)) {
-            throw new Error("名稱請輸入 1 至 40 個字，且不可包含換行。");
-        }
-        if (!PROFILE_AVATARS.has(avatarKey)) throw new Error("請選擇有效的頭貼。");
-        const metadata = { display_name: name, avatar_key: avatarKey };
-        if (isDemoMemberActive()) {
-            localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(metadata));
-            currentSession = buildDemoSession();
-        } else {
-            if (!supabase) throw new Error("會員服務尚未設定。");
-            const { data, error } = await supabase.auth.updateUser({ data: metadata });
-            if (error) throw error;
-            if (!data?.user) throw new Error("無法確認個人資料已儲存，請稍後重試。");
-            currentSession = {
-                ...currentSession,
-                user: {
-                    ...currentSession.user,
-                    ...data.user,
-                    user_metadata: {
-                        ...currentSession.user.user_metadata,
-                        ...data.user.user_metadata,
-                        ...metadata
-                    }
-                }
-            };
-        }
-        setAuthUiBySession(currentSession);
-        const profile = getProfile();
-        window.dispatchEvent(new CustomEvent("smartinvest:profile-updated", { detail: profile }));
-        return profile;
-    },
     getUserId: () => currentSession?.user?.id || null,
     getToken: async () => {
+        if (localStorage.getItem(GUEST_MODE_KEY) === "1") return null;
+        if (isAdminDemoActive()) {
+            if (currentSession?.access_token !== ADMIN_DEMO_TOKEN) {
+                currentSession = buildAdminDemoSession();
+                updateMembership(currentSession);
+            }
+            return ADMIN_DEMO_TOKEN;
+        }
         if (isDemoMemberActive()) {
-            currentSession = buildDemoSession();
+            if (currentSession?.access_token !== DEMO_MEMBER_TOKEN) {
+                currentSession = buildDemoSession();
+                updateMembership(currentSession);
+            }
             return DEMO_MEMBER_TOKEN;
         }
         if (!supabase) return null;
@@ -494,7 +523,10 @@ window.authManager = {
             if (error) throw error;
             const session = data?.session;
             if (session?.access_token) {
-                currentSession = session;
+                if (currentSession?.access_token !== session.access_token) {
+                    currentSession = session;
+                    updateMembership(session);
+                }
                 return session.access_token;
             }
         } catch (error) {
@@ -511,9 +543,23 @@ if (supabase) {
             await applyAuthFromUrl();
             await refreshSession();
             supabase.auth.onAuthStateChange((_event, session) => {
-                const effectiveSession = applyAuthState(session);
-                console.log("[auth] onAuthStateChange", _event, Boolean(effectiveSession));
-                if (effectiveSession && !effectiveSession.user?.is_demo) {
+                if (!session && _event !== "SIGNED_OUT") {
+                    if (isAdminDemoActive()) {
+                        currentSession = buildAdminDemoSession();
+                        updateMembership(currentSession);
+                        setAuthUiBySession(currentSession);
+                    } else if (isDemoMemberActive()) {
+                        currentSession = buildDemoSession();
+                        updateMembership(currentSession);
+                        setAuthUiBySession(currentSession);
+                    }
+                    return;
+                }
+                currentSession = session || null;
+                updateMembership(session || null);
+                setAuthUiBySession(session || null);
+                console.log("[auth] onAuthStateChange", _event, session);
+                if (session) {
                     clearUrlHashAfterLogin();
                 }
             });
